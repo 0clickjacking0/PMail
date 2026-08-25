@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-func TestSendMailUnsafeUsesFinalDataResponseAsDeliveryResult(t *testing.T) {
+func TestSendMailUnsafeStaysPlaintextAndUsesFinalDataResponseAsDeliveryResult(t *testing.T) {
 	tests := []struct {
 		name                 string
 		dataResponse         string
@@ -108,7 +108,11 @@ func startSMTPTransactionServer(t *testing.T, dataResponse string, holdWithoutQu
 			done <- err
 			return
 		}
-		if err := text.PrintfLine("250 test"); err != nil {
+		if err := text.PrintfLine("250-test"); err != nil {
+			done <- err
+			return
+		}
+		if err := text.PrintfLine("250 STARTTLS"); err != nil {
 			done <- err
 			return
 		}

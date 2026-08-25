@@ -1,8 +1,6 @@
 package send
 
 import (
-	"crypto/tls"
-	"crypto/x509"
 	"errors"
 	"fmt"
 	"github.com/Jinnrry/pmail/config"
@@ -18,12 +16,17 @@ import (
 	"net/textproto"
 	"strings"
 	"sync"
+	"time"
 )
 
 type mxDomain struct {
-	domain string
-	mxHost string
+	recipientDomain string
+	failureKey      string
+	mxHost          string
 }
+
+type lookupMXFunc func(string) ([]*net.MX, error)
+type plaintextSendFunc func(addr, from, fromDomain string, to []string, data []byte) error
 
 type temporaryMXFallbackError struct {
 	lookupErr   error
@@ -82,6 +85,11 @@ func Send(ctx *context.Context, e *parsemail.Email) (error, map[string]error) {
 }
 
 func doSend(ctx *context.Context, fromDomain string, data []byte, to []*parsemail.User, from string) (error, map[string]error) {
+	return doSendWith(ctx, fromDomain, data, to, from, net.LookupMX, sendPlaintext)
+}
+
+func doSendWith(ctx *context.Context, fromDomain string, data []byte, to []*parsemail.User, from string, lookupMX lookupMXFunc, sendMail plaintextSendFunc) (error, map[string]error) {
+	startedAt := time.Now()
 
 	// 按域名整理
 	toByDomain := map[mxDomain][]*parsemail.User{}
@@ -92,24 +100,27 @@ func doSend(ctx *context.Context, fromDomain string, data []byte, to []*parsemai
 			if args[1] == consts.TEST_DOMAIN {
 				// 测试使用
 				address := mxDomain{
-					domain: "localhost",
-					mxHost: "127.0.0.1",
+					recipientDomain: args[1],
+					failureKey:      "localhost",
+					mxHost:          "127.0.0.1",
 				}
 				toByDomain[address] = append(toByDomain[address], s)
 			} else {
 				//查询dns mx记录
-				mxInfo, lookupErr := net.LookupMX(args[1])
+				mxInfo, lookupErr := lookupMX(args[1])
 				address := mxDomain{
-					domain: "smtp." + args[1],
-					mxHost: "smtp." + args[1],
+					recipientDomain: args[1],
+					failureKey:      "smtp." + args[1],
+					mxHost:          "smtp." + args[1],
 				}
 				if lookupErr != nil {
 					log.WithContext(ctx).Errorf("%s 域名mx记录查询失败，检查邮箱是否存在！", s.EmailAddress)
 				}
 				if len(mxInfo) > 0 {
 					address = mxDomain{
-						domain: args[1],
-						mxHost: mxInfo[0].Host,
+						recipientDomain: args[1],
+						failureKey:      args[1],
+						mxHost:          mxInfo[0].Host,
 					}
 				}
 				if lookupErr != nil {
@@ -144,74 +155,19 @@ func doSend(ctx *context.Context, fromDomain string, data []byte, to []*parsemai
 				}
 				errEmailAddressMu.Unlock()
 
-				errMap.Store(domain.domain, err)
+				errMap.Store(domain.failureKey, err)
 			}
 
-			if domain.domain == "localhost" {
-				err := smtp.SendMailUnsafe("", domain.mxHost+":25", nil, from, fromDomain, buildAddress(tos), data)
-				if err != nil {
-					recordFailure(err)
-				}
-				return
-			}
-
-			// 优先尝试25端口，starttls方式投递
-			err := smtp.SendMail("", domain.mxHost+":25", nil, from, fromDomain, buildAddress(tos), data)
-			if err == nil {
-				return
-			}
-			// 证书错误，从新选取证书发送
-			var certificateErr *tls.CertificateVerificationError
-			if errors.As(err, &certificateErr) {
-				// 单测使用
-				var hostnameErr x509.HostnameError
-				if errors.As(certificateErr.Err, &hostnameErr) {
-					if hostnameErr.Certificate != nil {
-						certificateHostName := hostnameErr.Certificate.DNSNames
-						// 重新选取证书发送
-						err = smtp.SendMail(domainMatch(domain.domain, certificateHostName), domain.mxHost+":25", nil, from, fromDomain, buildAddress(tos), data)
-					}
-				}
-			}
-			if err == nil {
-				return
-			}
-			if isPermanentSMTPResponse(err) {
+			smtpStartedAt := time.Now()
+			err := sendMail(domain.mxHost+":25", from, fromDomain, buildAddress(tos), data)
+			smtpDuration := time.Since(smtpStartedAt)
+			if err != nil {
+				log.WithContext(ctx).Infof("Outbound SMTP delivery path=plaintext port=25 domain=%s mx=%s recipients=%d result=failure smtp_duration=%s", domain.recipientDomain, domain.mxHost, len(tos), smtpDuration)
 				recordFailure(err)
 				return
 			}
-			log.WithContext(ctx).Infof("SMTP STARTTLS on 25 Send Error. %s", err.Error())
 
-			// 再试用587投递
-			err = smtp.SendMailWithTls("", domain.mxHost+":587", nil, from, fromDomain, buildAddress(tos), data)
-			if err == nil {
-				return
-			}
-			if isPermanentSMTPResponse(err) {
-				recordFailure(err)
-				return
-			}
-			log.WithContext(ctx).Infof("SMTPS on 587 Send Error. %s", err.Error())
-
-			// 再次尝试465投递
-			err = smtp.SendMailWithTls("", domain.mxHost+":465", nil, from, fromDomain, buildAddress(tos), data)
-			if err == nil {
-				return
-			}
-			if isPermanentSMTPResponse(err) {
-				recordFailure(err)
-				return
-			}
-			log.WithContext(ctx).Infof("SMTPS on 465 Send Error. %s", err.Error())
-
-			// 最后尝试非安全方式投递
-			err = smtp.SendMailUnsafe("", domain.mxHost+":25", nil, from, fromDomain, buildAddress(tos), data)
-			if err == nil {
-				log.WithContext(ctx).Warnf("Send By Unsafe SMTP")
-				return
-			}
-
-			recordFailure(err)
+			log.WithContext(ctx).Infof("Outbound SMTP delivery path=plaintext port=25 domain=%s mx=%s recipients=%d result=success smtp_duration=%s", domain.recipientDomain, domain.mxHost, len(tos), smtpDuration)
 		}, nil)
 	}
 	as.Wait()
@@ -227,10 +183,20 @@ func doSend(ctx *context.Context, fromDomain string, data []byte, to []*parsemai
 		return true
 	})
 
+	result := "success"
+	if len(errEmailAddress) > 0 {
+		result = "failure"
+	}
+	log.WithContext(ctx).Infof("Outbound SMTP batch path=plaintext port=25 domains=%d failed_recipients=%d result=%s duration=%s", len(toByDomain), len(errEmailAddress), result, time.Since(startedAt))
+
 	if len(errEmailAddress) > 0 {
 		return errors.New("以下收件人投递失败：" + array.Join(errEmailAddress, ",")), orgMap
 	}
 	return nil, orgMap
+}
+
+func sendPlaintext(addr, from, fromDomain string, to []string, data []byte) error {
+	return smtp.SendMailUnsafe("", addr, nil, from, fromDomain, to, data)
 }
 
 func isPermanentSMTPResponse(err error) bool {
@@ -268,60 +234,4 @@ func buildAddress(u []*parsemail.User) []string {
 	}
 
 	return ret
-}
-
-func domainMatch(domain string, dnsNames []string) string {
-	if len(dnsNames) == 0 {
-		return domain
-	}
-
-	secondMatch := ""
-
-	for _, name := range dnsNames {
-		if strings.Contains(name, "smtp") {
-			secondMatch = name
-		}
-
-		if name == domain {
-			return name
-		}
-		if strings.Contains(name, "*") {
-			nameArg := strings.Split(name, ".")
-			domainArg := strings.Split(domain, ".")
-			match := true
-			for i := 0; i < len(nameArg); i++ {
-				if nameArg[len(nameArg)-1-i] == "*" {
-					continue
-				}
-				if len(domainArg) > i {
-					if nameArg[len(nameArg)-1-i] == domainArg[len(domainArg)-1-i] {
-						continue
-					}
-				}
-				match = false
-				break
-			}
-
-			for i := 0; i < len(domainArg); i++ {
-				if len(nameArg) > i && nameArg[len(nameArg)-1-i] == domainArg[len(domainArg)-1-i] {
-					continue
-				}
-				if len(nameArg) > i && nameArg[len(nameArg)-1-i] == "*" {
-					continue
-				}
-
-				match = false
-				break
-			}
-			if match {
-				return domain
-			}
-		}
-	}
-
-	if secondMatch != "" {
-		return strings.ReplaceAll(secondMatch, "*.", "")
-	}
-
-	return strings.ReplaceAll(dnsNames[0], "*.", "")
 }
