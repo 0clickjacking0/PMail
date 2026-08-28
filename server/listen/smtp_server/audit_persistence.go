@@ -60,7 +60,7 @@ func (s *Session) deliverOutgoingEmail(email *parsemail.Email, sender outgoingSe
 
 func runSendAfterHooks(ctx *context.Context, email *parsemail.Email, domainErrors map[string]error) {
 	process := async.New(ctx)
-	for _, hook := range hooks.HookList {
+	for _, hook := range hooks.AllHooks() {
 		if hook == nil {
 			continue
 		}

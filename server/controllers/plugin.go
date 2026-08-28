@@ -11,7 +11,7 @@ import (
 
 func GetPluginList(ctx *context.Context, w http.ResponseWriter, req *http.Request) {
 	ret := []string{}
-	for s, _ := range hooks.HookList {
+	for _, s := range hooks.HookNames() {
 		ret = append(ret, s)
 	}
 	response.NewSuccessResponse(ret).FPrint(w)
@@ -26,7 +26,7 @@ func SettingsHtml(ctx *context.Context, w http.ResponseWriter, req *http.Request
 	}
 
 	pluginName := args[4]
-	if plugin, ok := hooks.HookList[pluginName]; ok {
+	if plugin, ok := hooks.GetHook(pluginName); ok {
 		dt, err := io.ReadAll(req.Body)
 		if err != nil {
 			response.NewErrorResponse(response.ParamsError, err.Error(), "").FPrint(w)

@@ -49,7 +49,7 @@ func (s *Session) Data(r io.Reader) error {
 	log.WithContext(ctx).Debugf("%s", string(emailData))
 
 	log.WithContext(ctx).Debugf("开始执行插件ReceiveParseBefore！")
-	for _, hook := range hooks.HookList {
+	for _, hook := range hooks.AllHooks() {
 		if hook == nil {
 			continue
 		}
@@ -79,7 +79,7 @@ func (s *Session) Data(r io.Reader) error {
 		}
 
 		log.WithContext(ctx).Debugf("开始执行插件SendBefore！")
-		for _, hook := range hooks.HookList {
+		for _, hook := range hooks.AllHooks() {
 			if hook == nil {
 				continue
 			}
@@ -110,7 +110,7 @@ func (s *Session) Data(r io.Reader) error {
 		email.Authentication = parsemail.NewEmailAuthentication(SPFStatus, dkimStatus)
 
 		log.WithContext(ctx).Debugf("开始执行插件ReceiveParseAfter！")
-		for _, hook := range hooks.HookList {
+		for _, hook := range hooks.AllHooks() {
 			if hook == nil {
 				continue
 			}
@@ -150,7 +150,7 @@ func (s *Session) Data(r io.Reader) error {
 			log.WithContext(ctx).Errorf("sql Error :%+v", err)
 		}
 		as3 := async.New(ctx)
-		for _, hook := range hooks.HookList {
+		for _, hook := range hooks.AllHooks() {
 			if hook == nil {
 				continue
 			}
