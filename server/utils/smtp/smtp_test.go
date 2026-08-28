@@ -77,6 +77,30 @@ func TestSendMailUnsafeUsesFinalDataResponseAsDeliveryResult(t *testing.T) {
 	}
 }
 
+func TestNewClientBoundsSilentServer(t *testing.T) {
+	if outboundSMTPTransactionTimeout != 30*time.Second {
+		t.Fatalf("outbound SMTP transaction timeout = %v, want 30s", outboundSMTPTransactionTimeout)
+	}
+
+	clientConn, serverConn := net.Pipe()
+	defer serverConn.Close()
+
+	start := time.Now()
+	client, err := newClientWithTimeout(clientConn, "silent.example", "example.com", 50*time.Millisecond)
+	duration := time.Since(start)
+	if client != nil {
+		client.Close()
+		t.Fatal("newClientWithTimeout() returned a client from a silent server")
+	}
+	var netErr net.Error
+	if !errors.As(err, &netErr) || !netErr.Timeout() {
+		t.Fatalf("newClientWithTimeout() error = %v, want timeout", err)
+	}
+	if duration > time.Second {
+		t.Fatalf("newClientWithTimeout() took %v, want at most 1s", duration)
+	}
+}
+
 func startSMTPTransactionServer(t *testing.T, dataResponse string, holdWithoutQuitReply bool) (string, <-chan error) {
 	t.Helper()
 

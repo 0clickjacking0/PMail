@@ -36,7 +36,11 @@ import (
 var NoSupportSTARTTLSError = errors.New("smtp: server doesn't support STARTTLS")
 var EOFError = errors.New("EOF")
 
-const outboundSMTPQuitWriteTimeout = 250 * time.Millisecond
+const (
+	outboundSMTPDialTimeout        = 2 * time.Second
+	outboundSMTPTransactionTimeout = 30 * time.Second
+	outboundSMTPQuitWriteTimeout   = 250 * time.Millisecond
+)
 
 // A Client represents a client connection to an SMTP server.
 type Client struct {
@@ -61,7 +65,7 @@ type Client struct {
 // Dial returns a new Client connected to an SMTP server at addr.
 // The addr must include a port, as in "mail.example.com:smtp".
 func Dial(addr, fromDomain string) (*Client, error) {
-	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	conn, err := net.DialTimeout("tcp", addr, outboundSMTPDialTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -81,7 +85,7 @@ func DialTls(addr, domain, fromDomain string) (*Client, error) {
 		ServerName:         domain,
 	}
 
-	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 2 * time.Second}, "tcp", addr, tlsconfig)
+	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: outboundSMTPDialTimeout}, "tcp", addr, tlsconfig)
 	if err != nil {
 		return nil, err
 	}
@@ -92,6 +96,15 @@ func DialTls(addr, domain, fromDomain string) (*Client, error) {
 // NewClient returns a new Client using an existing connection and host as a
 // server name to be used when authenticating.
 func NewClient(conn net.Conn, host, fromDomain string) (*Client, error) {
+	return newClientWithTimeout(conn, host, fromDomain, outboundSMTPTransactionTimeout)
+}
+
+func newClientWithTimeout(conn net.Conn, host, fromDomain string, timeout time.Duration) (*Client, error) {
+	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+		conn.Close()
+		return nil, err
+	}
+
 	text := textproto.NewConn(conn)
 	_, _, err := text.ReadResponse(220)
 	if err != nil {
