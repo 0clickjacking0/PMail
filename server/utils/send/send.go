@@ -25,6 +25,12 @@ type mxDomain struct {
 	mxHost string
 }
 
+// mxFailoverEntry 记录一个收件人域名的全部 MX 主机（按优先级排序）。
+type mxFailoverEntry struct {
+	domain  string
+	mxHosts []string
+}
+
 type temporaryMXFallbackError struct {
 	lookupErr   error
 	fallbackErr error
@@ -86,6 +92,8 @@ func doSend(ctx *context.Context, fromDomain string, data []byte, to []*parsemai
 	// 按域名整理
 	toByDomain := map[mxDomain][]*parsemail.User{}
 	mxLookupErrors := map[mxDomain]error{}
+	// mxFailoverMap 保存每个域名的完整 MX 列表（按优先级排序），用于故障转移
+	mxFailoverMap := map[string][]string{}
 	for _, s := range to {
 		args := strings.Split(s.EmailAddress, "@")
 		if len(args) == 2 {
@@ -111,6 +119,12 @@ func doSend(ctx *context.Context, fromDomain string, data []byte, to []*parsemai
 						domain: args[1],
 						mxHost: mxInfo[0].Host,
 					}
+					// 保存全部 MX 主机（net.LookupMX 已按优先级排序）
+					allHosts := make([]string, 0, len(mxInfo))
+					for _, mx := range mxInfo {
+						allHosts = append(allHosts, mx.Host)
+					}
+					mxFailoverMap[args[1]] = allHosts
 				}
 				if lookupErr != nil {
 					mxLookupErrors[address] = lookupErr
@@ -155,63 +169,33 @@ func doSend(ctx *context.Context, fromDomain string, data []byte, to []*parsemai
 				return
 			}
 
-			// 优先尝试25端口，starttls方式投递
-			err := smtp.SendMail("", domain.mxHost+":25", nil, from, fromDomain, buildAddress(tos), data)
-			if err == nil {
-				return
+			// 获取该域名的全部 MX 主机（按优先级排序），用于故障转移
+			mxHosts := mxFailoverMap[domain.domain]
+			if len(mxHosts) == 0 {
+				mxHosts = []string{domain.mxHost}
 			}
-			// 证书错误，从新选取证书发送
-			var certificateErr *tls.CertificateVerificationError
-			if errors.As(err, &certificateErr) {
-				// 单测使用
-				var hostnameErr x509.HostnameError
-				if errors.As(certificateErr.Err, &hostnameErr) {
-					if hostnameErr.Certificate != nil {
-						certificateHostName := hostnameErr.Certificate.DNSNames
-						// 重新选取证书发送
-						err = smtp.SendMail(domainMatch(domain.domain, certificateHostName), domain.mxHost+":25", nil, from, fromDomain, buildAddress(tos), data)
-					}
+
+			// 按优先级逐个尝试 MX 主机（RFC 5321 §5.1）
+			var lastErr error
+			for i, mxHost := range mxHosts {
+				if i > 0 {
+					log.WithContext(ctx).Infof("MX %s 投递失败，尝试下一个 MX: %s (%d/%d)", mxHosts[i-1], mxHost, i+1, len(mxHosts))
+				}
+
+				err := tryDeliverToMX(ctx, mxHost, domain.domain, from, fromDomain, buildAddress(tos), data)
+				if err == nil {
+					return
+				}
+				lastErr = err
+
+				// 5xx 永久错误是收件人/邮箱层面的拒绝，换 MX 也不会成功
+				if isPermanentSMTPResponse(err) {
+					recordFailure(err)
+					return
 				}
 			}
-			if err == nil {
-				return
-			}
-			if isPermanentSMTPResponse(err) {
-				recordFailure(err)
-				return
-			}
-			log.WithContext(ctx).Infof("SMTP STARTTLS on 25 Send Error. %s", err.Error())
 
-			// 再试用587投递
-			err = smtp.SendMailWithTls("", domain.mxHost+":587", nil, from, fromDomain, buildAddress(tos), data)
-			if err == nil {
-				return
-			}
-			if isPermanentSMTPResponse(err) {
-				recordFailure(err)
-				return
-			}
-			log.WithContext(ctx).Infof("SMTPS on 587 Send Error. %s", err.Error())
-
-			// 再次尝试465投递
-			err = smtp.SendMailWithTls("", domain.mxHost+":465", nil, from, fromDomain, buildAddress(tos), data)
-			if err == nil {
-				return
-			}
-			if isPermanentSMTPResponse(err) {
-				recordFailure(err)
-				return
-			}
-			log.WithContext(ctx).Infof("SMTPS on 465 Send Error. %s", err.Error())
-
-			// 最后尝试非安全方式投递
-			err = smtp.SendMailUnsafe("", domain.mxHost+":25", nil, from, fromDomain, buildAddress(tos), data)
-			if err == nil {
-				log.WithContext(ctx).Warnf("Send By Unsafe SMTP")
-				return
-			}
-
-			recordFailure(err)
+			recordFailure(lastErr)
 		}, nil)
 	}
 	as.Wait()
@@ -236,6 +220,63 @@ func doSend(ctx *context.Context, fromDomain string, data []byte, to []*parsemai
 func isPermanentSMTPResponse(err error) bool {
 	var protocolErr *textproto.Error
 	return errors.As(err, &protocolErr) && protocolErr.Code >= 500 && protocolErr.Code <= 599
+}
+
+// tryDeliverToMX 尝试向单个 MX 主机投递，按原有策略依次尝试
+// STARTTLS:25 → 587 → 465 → 明文:25
+func tryDeliverToMX(ctx *context.Context, mxHost, domain, from, fromDomain string, to []string, data []byte) error {
+	// 优先尝试25端口，starttls方式投递
+	err := smtp.SendMail("", mxHost+":25", nil, from, fromDomain, to, data)
+	if err == nil {
+		return nil
+	}
+	// 证书错误，从新选取证书发送
+	var certificateErr *tls.CertificateVerificationError
+	if errors.As(err, &certificateErr) {
+		var hostnameErr x509.HostnameError
+		if errors.As(certificateErr.Err, &hostnameErr) {
+			if hostnameErr.Certificate != nil {
+				certificateHostName := hostnameErr.Certificate.DNSNames
+				err = smtp.SendMail(domainMatch(domain, certificateHostName), mxHost+":25", nil, from, fromDomain, to, data)
+			}
+		}
+	}
+	if err == nil {
+		return nil
+	}
+	if isPermanentSMTPResponse(err) {
+		return err
+	}
+	log.WithContext(ctx).Infof("SMTP STARTTLS on 25 Send Error. %s", err.Error())
+
+	// 再试用587投递
+	err = smtp.SendMailWithTls("", mxHost+":587", nil, from, fromDomain, to, data)
+	if err == nil {
+		return nil
+	}
+	if isPermanentSMTPResponse(err) {
+		return err
+	}
+	log.WithContext(ctx).Infof("SMTPS on 587 Send Error. %s", err.Error())
+
+	// 再次尝试465投递
+	err = smtp.SendMailWithTls("", mxHost+":465", nil, from, fromDomain, to, data)
+	if err == nil {
+		return nil
+	}
+	if isPermanentSMTPResponse(err) {
+		return err
+	}
+	log.WithContext(ctx).Infof("SMTPS on 465 Send Error. %s", err.Error())
+
+	// 最后尝试非安全方式投递
+	err = smtp.SendMailUnsafe("", mxHost+":25", nil, from, fromDomain, to, data)
+	if err == nil {
+		log.WithContext(ctx).Warnf("Send By Unsafe SMTP")
+		return nil
+	}
+
+	return err
 }
 
 func deliveryFailureCause(mxLookupErr, fallbackErr error) error {
