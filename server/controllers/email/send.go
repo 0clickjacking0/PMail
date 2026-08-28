@@ -163,7 +163,7 @@ func Send(ctx *context.Context, w http.ResponseWriter, req *http.Request) {
 	}
 
 	log.WithContext(ctx).Debugf("插件执行--SendBefore")
-	for _, hook := range hooks.HookList {
+	for _, hook := range hooks.AllHooks() {
 		if hook == nil {
 			continue
 		}
@@ -212,7 +212,7 @@ func Send(ctx *context.Context, w http.ResponseWriter, req *http.Request) {
 		log.WithContext(ctx).Debugf("插件执行--SendAfter")
 
 		as2 := async.New(ctx)
-		for _, hook := range hooks.HookList {
+		for _, hook := range hooks.AllHooks() {
 			if hook == nil {
 				continue
 			}

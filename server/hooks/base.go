@@ -15,11 +15,60 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
 // HookList
 var HookList map[string]framework.EmailHook
+
+// hookListMu 保护 HookList。插件进程退出时会并发地从 HookList 移除条目，
+// 而收发邮件的 goroutine 会并发读取，必须加锁避免数据竞争。
+var hookListMu sync.RWMutex
+
+// AllHooks 返回当前已注册插件的快照，供收发邮件时并发安全地遍历。
+func AllHooks() []framework.EmailHook {
+	hookListMu.RLock()
+	defer hookListMu.RUnlock()
+	list := make([]framework.EmailHook, 0, len(HookList))
+	for _, h := range HookList {
+		list = append(list, h)
+	}
+	return list
+}
+
+// HookNames 返回已注册插件的名称列表。
+func HookNames() []string {
+	hookListMu.RLock()
+	defer hookListMu.RUnlock()
+	names := make([]string, 0, len(HookList))
+	for name := range HookList {
+		names = append(names, name)
+	}
+	return names
+}
+
+// GetHook 返回指定名称的插件。
+func GetHook(name string) (framework.EmailHook, bool) {
+	hookListMu.RLock()
+	defer hookListMu.RUnlock()
+	h, ok := HookList[name]
+	return h, ok
+}
+
+// RegisterHook 注册一个插件。
+func RegisterHook(name string, h framework.EmailHook) {
+	hookListMu.Lock()
+	defer hookListMu.Unlock()
+	HookList[name] = h
+}
+
+// RemoveHook 移除指定名称的插件。
+func RemoveHook(name string) {
+	hookListMu.Lock()
+	defer hookListMu.Unlock()
+	delete(HookList, name)
+}
 
 type HookSender struct {
 	httpc  http.Client
@@ -236,10 +285,22 @@ func Init(serverVersion string) {
 
 			pluginNo++
 
+			// registeredName 记录该插件最终注册进 HookList 使用的键。
+			// 清理协程在插件进程退出后必须用同一个键去移除，
+			// 否则会残留指向已死亡 socket 的 HookSender。
+			var registeredName string
+			var registeredNameMu sync.Mutex
+
 			go func() {
 				stat, err := p.Wait()
 				log.Errorf("[%s] Plugin Stop. Error:%v Stat:%v", info.Name(), err, stat.String())
-				delete(HookList, info.Name())
+				registeredNameMu.Lock()
+				name := registeredName
+				registeredNameMu.Unlock()
+				if name != "" {
+					RemoveHook(name)
+					log.Infof("[%s] Plugin Removed From HookList", name)
+				}
 				os.Remove(socketPath)
 			}()
 
@@ -257,7 +318,14 @@ func Init(serverVersion string) {
 			if loadSucc {
 				hk := NewHookSender(socketPath, info.Name(), serverVersion)
 				hkName := hk.GetName(&context.Context{})
-				HookList[hkName] = hk
+				if hkName == "" {
+					// GetName 失败时退回插件文件名作为键，避免出现空键。
+					hkName = info.Name()
+				}
+				RegisterHook(hkName, hk)
+				registeredNameMu.Lock()
+				registeredName = hkName
+				registeredNameMu.Unlock()
 				log.Infof("[%s] Plugin Load Success!", hkName)
 			}
 
