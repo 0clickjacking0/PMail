@@ -94,6 +94,9 @@ func doSendWith(ctx *context.Context, fromDomain string, data []byte, to []*pars
 	// 按域名整理
 	toByDomain := map[mxDomain][]*parsemail.User{}
 	mxLookupErrors := map[mxDomain]error{}
+	// mxHostsByFailureKey 保存每个域名按优先级排序的全部 MX 主机，
+	// 投递失败时逐个故障转移（RFC 5321 §5.1）
+	mxHostsByFailureKey := map[string][]string{}
 	for _, s := range to {
 		args := strings.Split(s.EmailAddress, "@")
 		if len(args) == 2 {
@@ -122,6 +125,12 @@ func doSendWith(ctx *context.Context, fromDomain string, data []byte, to []*pars
 						failureKey:      args[1],
 						mxHost:          mxInfo[0].Host,
 					}
+					// net.LookupMX 已按优先级排序，保存全部 MX 用于故障转移
+					hosts := make([]string, 0, len(mxInfo))
+					for _, mx := range mxInfo {
+						hosts = append(hosts, mx.Host)
+					}
+					mxHostsByFailureKey[address.failureKey] = hosts
 				}
 				if lookupErr != nil {
 					mxLookupErrors[address] = lookupErr
@@ -158,16 +167,28 @@ func doSendWith(ctx *context.Context, fromDomain string, data []byte, to []*pars
 				errMap.Store(domain.failureKey, err)
 			}
 
-			smtpStartedAt := time.Now()
-			err := sendMail(domain.mxHost+":25", from, fromDomain, buildAddress(tos), data)
-			smtpDuration := time.Since(smtpStartedAt)
-			if err != nil {
-				log.WithContext(ctx).Infof("Outbound SMTP delivery path=plaintext port=25 domain=%s mx=%s recipients=%d result=failure smtp_duration=%s", domain.recipientDomain, domain.mxHost, len(tos), smtpDuration)
-				recordFailure(err)
-				return
+			// 按优先级逐个尝试 MX 主机（RFC 5321 §5.1）：
+			// 网络错误/超时等临时失败转移下一个；5xx 永久错误直接失败（换 MX 也不会成功）
+			mxHosts := mxHostsByFailureKey[domain.failureKey]
+			if len(mxHosts) == 0 {
+				mxHosts = []string{domain.mxHost}
 			}
-
-			log.WithContext(ctx).Infof("Outbound SMTP delivery path=plaintext port=25 domain=%s mx=%s recipients=%d result=success smtp_duration=%s", domain.recipientDomain, domain.mxHost, len(tos), smtpDuration)
+			var lastErr error
+			for i, mxHost := range mxHosts {
+				smtpStartedAt := time.Now()
+				err := sendMail(mxHost+":25", from, fromDomain, buildAddress(tos), data)
+				smtpDuration := time.Since(smtpStartedAt)
+				if err == nil {
+					log.WithContext(ctx).Infof("Outbound SMTP delivery path=plaintext port=25 domain=%s mx=%s mx_attempt=%d/%d recipients=%d result=success smtp_duration=%s", domain.recipientDomain, mxHost, i+1, len(mxHosts), len(tos), smtpDuration)
+					return
+				}
+				log.WithContext(ctx).Infof("Outbound SMTP delivery path=plaintext port=25 domain=%s mx=%s mx_attempt=%d/%d recipients=%d result=failure smtp_duration=%s", domain.recipientDomain, mxHost, i+1, len(mxHosts), len(tos), smtpDuration)
+				lastErr = err
+				if isPermanentSMTPResponse(err) {
+					break
+				}
+			}
+			recordFailure(lastErr)
 		}, nil)
 	}
 	as.Wait()
