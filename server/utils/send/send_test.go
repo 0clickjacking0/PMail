@@ -1,12 +1,172 @@
 package send
 
 import (
+	stdcontext "context"
 	"errors"
 	"fmt"
+	"github.com/Jinnrry/pmail/dto/parsemail"
+	pmailcontext "github.com/Jinnrry/pmail/utils/context"
 	"net"
 	"net/textproto"
+	"strings"
 	"testing"
 )
+
+func TestDoSendUsesSinglePlaintextPort25Delivery(t *testing.T) {
+	tests := []struct {
+		name             string
+		recipient        string
+		mx               []*net.MX
+		lookupErr        error
+		sendErr          error
+		wantLookupDomain string
+		wantAddr         string
+		wantErrKey       string
+	}{
+		{
+			name:             "MX delivery",
+			recipient:        "recipient@example.net",
+			mx:               []*net.MX{{Host: "mx.example.net."}},
+			wantLookupDomain: "example.net",
+			wantAddr:         "mx.example.net.:25",
+		},
+		{
+			name:             "failure is returned without fallback",
+			recipient:        "recipient@example.net",
+			mx:               []*net.MX{{Host: "mx.example.net."}},
+			sendErr:          errors.New("connection refused"),
+			wantLookupDomain: "example.net",
+			wantAddr:         "mx.example.net.:25",
+			wantErrKey:       "example.net",
+		},
+		{
+			name:             "DNS fallback",
+			recipient:        "recipient@missing.example",
+			lookupErr:        &net.DNSError{Err: "no such host", Name: "missing.example", IsNotFound: true},
+			wantLookupDomain: "missing.example",
+			wantAddr:         "smtp.missing.example:25",
+		},
+		{
+			name:      "test domain",
+			recipient: "recipient@test.domain",
+			wantAddr:  "127.0.0.1:25",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			lookupCalls := 0
+			lookupMX := func(domain string) ([]*net.MX, error) {
+				lookupCalls++
+				if domain != tt.wantLookupDomain {
+					t.Errorf("lookupMX() domain = %q, want %q", domain, tt.wantLookupDomain)
+				}
+				return tt.mx, tt.lookupErr
+			}
+
+			sendCalls := 0
+			sendMail := func(addr, from, fromDomain string, to []string, data []byte) error {
+				sendCalls++
+				if addr != tt.wantAddr {
+					t.Errorf("sendMail() addr = %q, want %q", addr, tt.wantAddr)
+				}
+				return tt.sendErr
+			}
+
+			ctx := &pmailcontext.Context{Context: stdcontext.Background()}
+			err, errMap := doSendWith(
+				ctx,
+				"example.com",
+				[]byte("Subject: test\r\n\r\nbody\r\n"),
+				[]*parsemail.User{{EmailAddress: tt.recipient}},
+				"sender@example.com",
+				lookupMX,
+				sendMail,
+			)
+
+			wantLookupCalls := 1
+			if tt.wantLookupDomain == "" {
+				wantLookupCalls = 0
+			}
+			if lookupCalls != wantLookupCalls {
+				t.Errorf("lookupMX() calls = %d, want %d", lookupCalls, wantLookupCalls)
+			}
+			if sendCalls != 1 {
+				t.Fatalf("sendMail() calls = %d, want 1", sendCalls)
+			}
+
+			if tt.wantErrKey != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.recipient) {
+					t.Fatalf("doSend() error = %v, want failed recipient", err)
+				}
+				if !errors.Is(errMap[tt.wantErrKey], tt.sendErr) {
+					t.Fatalf("doSend() domain error = %v, want %v", errMap[tt.wantErrKey], tt.sendErr)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("doSend() error = %v, want nil", err)
+			}
+			if len(errMap) != 0 {
+				t.Fatalf("doSend() error map = %v, want empty", errMap)
+			}
+		})
+	}
+}
+
+func TestDoSendKeepsFailuresFromMixedMXResolution(t *testing.T) {
+	lookupCalls := 0
+	lookupErr := &net.DNSError{Err: "server misbehaving", Name: "example.net", IsTemporary: true}
+	lookupMX := func(domain string) ([]*net.MX, error) {
+		lookupCalls++
+		if lookupCalls == 1 {
+			return []*net.MX{{Host: "mx.example.net."}}, nil
+		}
+		return nil, lookupErr
+	}
+
+	permanentErr := &textproto.Error{Code: 550, Msg: "mailbox unavailable"}
+	temporaryErr := &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")}
+	sendMail := func(addr, from, fromDomain string, to []string, data []byte) error {
+		switch addr {
+		case "mx.example.net.:25":
+			return permanentErr
+		case "smtp.example.net:25":
+			return temporaryErr
+		default:
+			return fmt.Errorf("unexpected SMTP address: %s", addr)
+		}
+	}
+
+	ctx := &pmailcontext.Context{Context: stdcontext.Background()}
+	err, errMap := doSendWith(
+		ctx,
+		"example.com",
+		[]byte("Subject: test\r\n\r\nbody\r\n"),
+		[]*parsemail.User{
+			{EmailAddress: "first@example.net"},
+			{EmailAddress: "second@example.net"},
+		},
+		"sender@example.com",
+		lookupMX,
+		sendMail,
+	)
+
+	if err == nil {
+		t.Fatal("doSendWith() error = nil, want delivery failure")
+	}
+	if len(errMap) != 2 {
+		t.Fatalf("doSendWith() error map = %v, want two independent delivery groups", errMap)
+	}
+	if !errors.Is(errMap["example.net"], permanentErr) {
+		t.Errorf("MX delivery error = %v, want %v", errMap["example.net"], permanentErr)
+	}
+	var fallbackErr *temporaryMXFallbackError
+	if !errors.As(errMap["smtp.example.net"], &fallbackErr) {
+		t.Errorf("fallback delivery error = %v, want *temporaryMXFallbackError", errMap["smtp.example.net"])
+	}
+}
 
 func TestIsPermanentSMTPResponse(t *testing.T) {
 	tests := []struct {
@@ -76,5 +236,92 @@ func TestDeliveryFailureCauseKeepsExplicitSMTPRejection(t *testing.T) {
 
 	if got := deliveryFailureCause(lookupErr, rejection); got != rejection {
 		t.Fatalf("deliveryFailureCause() = %v, want explicit SMTP rejection %v", got, rejection)
+	}
+}
+
+// TestDoSendFailsOverToNextMX 验证临时错误时按优先级故障转移到下一个 MX。
+func TestDoSendFailsOverToNextMX(t *testing.T) {
+	lookupMX := func(domain string) ([]*net.MX, error) {
+		// 返回两个 MX，按优先级排序（第一个优先级更高）
+		return []*net.MX{
+			{Host: "mx1.example.net.", Pref: 10},
+			{Host: "mx2.example.net.", Pref: 20},
+		}, nil
+	}
+
+	tempErr := &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("i/o timeout")}
+	var sentTo []string
+	sendMail := func(addr, from, fromDomain string, to []string, data []byte) error {
+		sentTo = append(sentTo, addr)
+		if addr == "mx1.example.net.:25" {
+			return tempErr // 第一个 MX 临时失败，应触发故障转移
+		}
+		if addr == "mx2.example.net.:25" {
+			return nil // 第二个 MX 成功
+		}
+		return fmt.Errorf("unexpected SMTP address: %s", addr)
+	}
+
+	ctx := &pmailcontext.Context{Context: stdcontext.Background()}
+	err, errMap := doSendWith(
+		ctx,
+		"example.com",
+		[]byte("Subject: test\r\n\r\nbody\r\n"),
+		[]*parsemail.User{{EmailAddress: "user@example.net"}},
+		"sender@example.com",
+		lookupMX,
+		sendMail,
+	)
+
+	if err != nil {
+		t.Fatalf("doSendWith() error = %v, want nil (failover succeeded)", err)
+	}
+	if len(errMap) != 0 {
+		t.Fatalf("doSendWith() error map = %v, want empty", errMap)
+	}
+	if len(sentTo) != 2 {
+		t.Fatalf("doSendWith() attempted %d deliveries, want 2 (mx1 then mx2)", len(sentTo))
+	}
+	if sentTo[0] != "mx1.example.net.:25" || sentTo[1] != "mx2.example.net.:25" {
+		t.Fatalf("doSendWith() delivery order = %v, want [mx1 mx2]", sentTo)
+	}
+}
+
+// TestDoSendStopsFailoverOnPermanentError 验证 5xx 永久错误不触发故障转移。
+func TestDoSendStopsFailoverOnPermanentError(t *testing.T) {
+	lookupMX := func(domain string) ([]*net.MX, error) {
+		return []*net.MX{
+			{Host: "mx1.example.net.", Pref: 10},
+			{Host: "mx2.example.net.", Pref: 20},
+		}, nil
+	}
+
+	permanentErr := &textproto.Error{Code: 550, Msg: "mailbox unavailable"}
+	var sentTo []string
+	sendMail := func(addr, from, fromDomain string, to []string, data []byte) error {
+		sentTo = append(sentTo, addr)
+		return permanentErr
+	}
+
+	ctx := &pmailcontext.Context{Context: stdcontext.Background()}
+	err, errMap := doSendWith(
+		ctx,
+		"example.com",
+		[]byte("Subject: test\r\n\r\nbody\r\n"),
+		[]*parsemail.User{{EmailAddress: "user@example.net"}},
+		"sender@example.com",
+		lookupMX,
+		sendMail,
+	)
+
+	if err == nil {
+		t.Fatal("doSendWith() error = nil, want permanent failure")
+	}
+	// 5xx 是收件人/邮箱层面的拒绝，不应尝试第二个 MX
+	if len(sentTo) != 1 {
+		t.Fatalf("doSendWith() attempted %d deliveries, want 1 (permanent error stops failover)", len(sentTo))
+	}
+	if !errors.Is(errMap["example.net"], permanentErr) {
+		t.Fatalf("doSendWith() domain error = %v, want %v", errMap["example.net"], permanentErr)
 	}
 }
