@@ -216,70 +216,13 @@ func doSendWith(ctx *context.Context, fromDomain string, data []byte, to []*pars
 	return nil, orgMap
 }
 
-func sendPlaintext(addr, from, fromDomain string, to []string, data []byte) error {
-	return smtp.SendMailUnsafe("", addr, nil, from, fromDomain, to, data)
-}
-
 func isPermanentSMTPResponse(err error) bool {
 	var protocolErr *textproto.Error
 	return errors.As(err, &protocolErr) && protocolErr.Code >= 500 && protocolErr.Code <= 599
 }
 
-// tryDeliverToMX 尝试向单个 MX 主机投递，按原有策略依次尝试
-// STARTTLS:25 → 587 → 465 → 明文:25
-func tryDeliverToMX(ctx *context.Context, mxHost, domain, from, fromDomain string, to []string, data []byte) error {
-	// 优先尝试25端口，starttls方式投递
-	err := smtp.SendMail("", mxHost+":25", nil, from, fromDomain, to, data)
-	if err == nil {
-		return nil
-	}
-	// 证书错误，从新选取证书发送
-	var certificateErr *tls.CertificateVerificationError
-	if errors.As(err, &certificateErr) {
-		var hostnameErr x509.HostnameError
-		if errors.As(certificateErr.Err, &hostnameErr) {
-			if hostnameErr.Certificate != nil {
-				certificateHostName := hostnameErr.Certificate.DNSNames
-				err = smtp.SendMail(domainMatch(domain, certificateHostName), mxHost+":25", nil, from, fromDomain, to, data)
-			}
-		}
-	}
-	if err == nil {
-		return nil
-	}
-	if isPermanentSMTPResponse(err) {
-		return err
-	}
-	log.WithContext(ctx).Infof("SMTP STARTTLS on 25 Send Error. %s", err.Error())
-
-	// 再试用587投递
-	err = smtp.SendMailWithTls("", mxHost+":587", nil, from, fromDomain, to, data)
-	if err == nil {
-		return nil
-	}
-	if isPermanentSMTPResponse(err) {
-		return err
-	}
-	log.WithContext(ctx).Infof("SMTPS on 587 Send Error. %s", err.Error())
-
-	// 再次尝试465投递
-	err = smtp.SendMailWithTls("", mxHost+":465", nil, from, fromDomain, to, data)
-	if err == nil {
-		return nil
-	}
-	if isPermanentSMTPResponse(err) {
-		return err
-	}
-	log.WithContext(ctx).Infof("SMTPS on 465 Send Error. %s", err.Error())
-
-	// 最后尝试非安全方式投递
-	err = smtp.SendMailUnsafe("", mxHost+":25", nil, from, fromDomain, to, data)
-	if err == nil {
-		log.WithContext(ctx).Warnf("Send By Unsafe SMTP")
-		return nil
-	}
-
-	return err
+func sendPlaintext(addr, from, fromDomain string, to []string, data []byte) error {
+	return smtp.SendMailUnsafe("", addr, nil, from, fromDomain, to, data)
 }
 
 func deliveryFailureCause(mxLookupErr, fallbackErr error) error {
