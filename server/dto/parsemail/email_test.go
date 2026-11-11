@@ -363,6 +363,29 @@ func TestEmailBuilderPreservesInlineCID(t *testing.T) {
 	}
 }
 
+func TestNewEmailFromReaderPreservesRawHTMLStyle(t *testing.T) {
+	raw := "From: sender@example.com\r\n" +
+		"To: recipient@example.net\r\n" +
+		"Subject: style test\r\n" +
+		"Date: Sun, 09 Aug 2026 11:51:08 +0000\r\n" +
+		"MIME-Version: 1.0\r\n" +
+		"Content-Type: multipart/alternative; boundary=alternative\r\n\r\n" +
+		"--alternative\r\n" +
+		"Content-Type: text/plain; charset=UTF-8\r\n\r\n" +
+		"hello\r\n" +
+		"--alternative\r\n" +
+		"Content-Type: text/html; charset=UTF-8\r\n\r\n" +
+		"<style>p{color:red}</style><p>hello</p>\r\n" +
+		"--alternative--\r\n"
+
+	email := NewEmailFromReader([]string{"recipient@example.net"}, strings.NewReader(raw), len(raw))
+	got := string(email.HTML)
+	want := "<style>p{color:red}</style><p>hello</p>"
+	if got != want {
+		t.Fatalf("HTML body was modified: got %q, want %q", got, want)
+	}
+}
+
 func TestEmail_BuildPart(t *testing.T) {
 	e := Email{
 		Text: []byte("text"),

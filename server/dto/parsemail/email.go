@@ -348,7 +348,10 @@ func formatContent(entity *message.Entity, ret *Email) error {
 			return nil
 		}
 
-		ret.HTML = []byte(relaxedPolicy.Sanitize(string(body)))
+		// Preserve the raw HTML body to match PMail v2.8.5 rendering behavior.
+		// This intentionally keeps <style> and other email-template markup, at the
+		// cost of re-opening the XSS risk fixed by upstream #289 / v2.8.6.
+		ret.HTML = body
 	case "multipart/related":
 		entity.Walk(func(path []int, entity *message.Entity, err error) error {
 			if t, _, _ := entity.Header.ContentType(); t == "multipart/related" {
